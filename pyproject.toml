@@ -1,0 +1,14 @@
+[project]
+name = "whisper-sub"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "mcp>=1.28.1",
+    "nvidia-cublas-cu12>=12.9.2.10",
+    "openai>=1.0.0",
+    "torch>=2.12.1",
+    "transformers>=5.12.1",
+]
