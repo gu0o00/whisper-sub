@@ -178,6 +178,7 @@ def translate_batch(
     temperature: float,
     max_tokens: int,
     retries: int = 2,
+    log=print,
 ) -> list[str]:
     """翻译一个批次，返回与 batch 等长的译文列表。
 
@@ -185,6 +186,9 @@ def translate_batch(
     1. 整批翻译，校验条目数；不匹配则重试；
     2. 数量匹配后逐条检测「回显/未翻译」，对疑似未翻译的条目单独重译；
     3. 整批仍失败则全部回退为逐条翻译。
+
+    log 为过程提示输出回调，默认 print（CLI 场景）；MCP 场景传入 stderr
+    logger 相关回调，避免直接写 stdout 破坏协议。
     """
     prompt = build_prompt(batch, target_lang)
     texts: list[str] | None = None
@@ -196,33 +200,36 @@ def translate_batch(
             if len(parsed) == len(batch):
                 texts = [e.text for e in parsed]
                 break
-            print(
-                f"   ⚠️  条目数不匹配（期望 {len(batch)}，得到 {len(parsed)}），"
-                f"重试 {attempt + 1}/{retries + 1}"
-            )
+            if log:
+                log(
+                    f"   ⚠️  条目数不匹配（期望 {len(batch)}，得到 {len(parsed)}），"
+                    f"重试 {attempt + 1}/{retries + 1}"
+                )
         except Exception as e:  # noqa: BLE001
-            print(f"   ⚠️  调用失败：{e}，重试 {attempt + 1}/{retries + 1}")
+            if log:
+                log(f"   ⚠️  调用失败：{e}，重试 {attempt + 1}/{retries + 1}")
             time.sleep(1)
 
     if texts is None:
         # 整批失败：全部回退为逐条翻译
-        print("   ↩️  批次翻译失败，回退为逐条翻译")
-        return [translate_single(client, model, e.text, target_lang, temperature)
+        if log:
+            log("   ↩️  批次翻译失败，回退为逐条翻译")
+        return [translate_single(client, model, e.text, target_lang, temperature, log)
                 for e in batch]
 
     # 回显检测：对疑似未翻译的条目单独重译
     fixed = 0
     for i, (src, dst) in enumerate(zip(batch, texts)):
         if is_likely_untranslated(src.text, dst):
-            retry = translate_single(client, model, src.text, target_lang, temperature)
+            retry = translate_single(client, model, src.text, target_lang, temperature, log)
             if not is_likely_untranslated(src.text, retry):
                 texts[i] = retry
                 fixed += 1
             else:
                 # 单条重译仍回显，保留单条结果（至少不混入整批失败）
                 texts[i] = retry
-    if fixed:
-        print(f"   🔁 检测到 {fixed} 条疑似未翻译，已单独重译")
+    if fixed and log:
+        log(f"   🔁 检测到 {fixed} 条疑似未翻译，已单独重译")
     return texts
 
 
@@ -232,6 +239,7 @@ def translate_single(
     text: str,
     target_lang: str,
     temperature: float,
+    log=print,
 ) -> str:
     """单条文本翻译回退路径。"""
     prompt = (
@@ -242,7 +250,8 @@ def translate_single(
         raw = call_model(client, model, prompt, temperature, max_tokens=512)
         return strip_code_fence(raw)
     except Exception as e:  # noqa: BLE001
-        print(f"   ❌ 单条翻译失败，保留原文：{e}")
+        if log:
+            log(f"   ❌ 单条翻译失败，保留原文：{e}")
         return text
 
 
@@ -273,24 +282,41 @@ def translate_batches(
     temperature: float,
     max_tokens: int,
     log=print,
+    progress=None,
 ) -> list[SrtEntry]:
     """逐批翻译并组装结果，按批次输出进度。
 
-    log 为进度输出回调，默认 print（CLI 场景）；MCP 等需要写入 stderr
-    的场景可传入 logger 相关回调。返回与输入条目顺序一致的已翻译条目列表。
+    log 为人类可读的进度文本回调，默认 print（CLI 场景）；MCP 等需要写入
+    stderr 的场景可传入 logger 相关回调。
+
+    progress 为结构化进度回调，签名为 progress(value, total, message=None)：
+    以「已完成的批次数 / 总批次数」作为进度比例，供 MCP 客户端渲染进度条。
+    默认 None（不上报）。
+
+    返回与输入条目顺序一致的已翻译条目列表。
     """
     translated: list[SrtEntry] = []
     total = len(batches)
     for bi, batch in enumerate(batches, start=1):
+        if progress:
+            progress(
+                bi - 1, total,
+                f"开始翻译批次 {bi}/{total}（{len(batch)} 条）",
+            )
         if log:
             log(f"⏳ 翻译批次 {bi}/{total}（{len(batch)} 条）...")
         texts = translate_batch(
-            client, model, batch, target_lang, temperature, max_tokens,
+            client, model, batch, target_lang, temperature, max_tokens, log=log,
         )
         for entry, text in zip(batch, texts):
             translated.append(
                 SrtEntry(index=entry.index, timestamp=entry.timestamp, text=text)
             )
+    if progress and total:
+        progress(
+            total, total,
+            f"翻译完成，共 {total} 批 / {len(translated)} 条",
+        )
     return translated
 
 

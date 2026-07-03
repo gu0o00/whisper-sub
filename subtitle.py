@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from faster_whisper import WhisperModel
 
 
-MAX_SEGMENT_DURATION = 10.0  # 单条字幕最大持续时长（秒）
+MAX_SEGMENT_DURATION = 5.0  # 单条字幕最大持续时长（秒）
 
 
 def format_timestamp(seconds: float) -> str:
@@ -63,24 +63,41 @@ def collect_segments(
     total_duration: float,
     progress_step: int = 50,
     log=print,
+    progress=None,
 ) -> list:
     """流式收集 faster-whisper 的惰性片段生成器。
 
     faster-whisper 的 transcribe() 返回惰性生成器，迭代才真正触发转写；
     长视频耗时很久，这里边收集边按周期输出进度，避免看起来像卡死。
 
-    log 为进度输出回调，默认 print（CLI 场景）；MCP 等需要写入 stderr
-    的场景可传入 logger 相关回调。
+    log 为人类可读的进度文本回调，默认 print（CLI 场景）；MCP 等需要写入
+    stderr 的场景可传入 logger 相关回调。
+
+    progress 为结构化进度回调，签名为 progress(value, total, message=None)：
+    以「已处理的音频秒数 / 总时长」作为进度比例（value=当前秒数，total=总秒数），
+    供 MCP 客户端渲染进度条。默认 None（不上报）。迭代结束后会上报一次 100%。
     """
     segments: list = []
     for seg in segments_iter:
         segments.append(seg)
         if progress_step and len(segments) % progress_step == 0:
-            log(f"  ... 已转写 {len(segments)} 段，当前 {seg.start:.0f}s / {total_duration:.0f}s")
+            # 以当前片段结束时间作为「已处理到的音频位置」，并夹紧到 [0, total]
+            cur = float(getattr(seg, "end", getattr(seg, "start", 0.0)) or 0.0)
+            cur = max(0.0, min(cur, total_duration))
+            if log:
+                log(f"  ... 已转写 {len(segments)} 段，当前 {cur:.0f}s / {total_duration:.0f}s")
+            if progress:
+                progress(
+                    cur, total_duration,
+                    f"已转写 {len(segments)} 段，{cur:.0f}s/{total_duration:.0f}s",
+                )
+    # 全部收集完成：上报 100%
+    if progress and total_duration:
+        progress(total_duration, total_duration, f"转写完成，共 {len(segments)} 段")
     return segments
 
 
-def generate_srt(segments: list, output_path: str) -> None:
+def generate_srt(segments: list, output_path: str, log=print) -> None:
     """将识别结果写入 SRT 字幕文件"""
     with open(output_path, "w", encoding="utf-8") as f:
         for i, segment in enumerate(segments, start=1):
@@ -89,10 +106,11 @@ def generate_srt(segments: list, output_path: str) -> None:
             text = segment.text.strip()
             f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
 
-    print(f"✅ 字幕已生成：{output_path}")
+    if log:
+        log(f"✅ 字幕已生成：{output_path}")
 
 
-def generate_txt(segments: list, output_path: str) -> None:
+def generate_txt(segments: list, output_path: str, log=print) -> None:
     """将识别结果写入纯文本文件（带时间戳）"""
     with open(output_path, "w", encoding="utf-8") as f:
         for segment in segments:
@@ -101,7 +119,8 @@ def generate_txt(segments: list, output_path: str) -> None:
             text = segment.text.strip()
             f.write(f"[{start} --> {end}] {text}\n")
 
-    print(f"✅ 文本已生成：{output_path}")
+    if log:
+        log(f"✅ 文本已生成：{output_path}")
 
 
 def main():

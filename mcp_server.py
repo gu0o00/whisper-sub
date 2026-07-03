@@ -21,6 +21,7 @@ whisper-sub MCP Server
 """
 
 import argparse
+import anyio
 import logging
 import os
 import sys
@@ -46,7 +47,7 @@ _cublas_dir = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia" / "cublas" /
 if _cublas_dir.is_dir():
     os.add_dll_directory(str(_cublas_dir))
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 # 复用现有脚本中的可复用函数
@@ -145,6 +146,22 @@ def get_whisper_model(
         return instance
 
 
+def _make_progress_cb(ctx: Context):
+    """构造同步 progress 回调：在工作线程里把进度通知调度回事件循环。
+
+    collect_segments / translate_batches 在 anyio.to_thread.run_sync 派生的
+    工作线程中调用本回调；通过 anyio.from_thread.run 把 ctx.report_progress
+    协程调度到事件循环线程执行，从而按 MCP 规范发送 notifications/progress。
+    进度上报失败不中断主流程，降级记到 stderr 日志。
+    """
+    def _cb(value, total, message=None):
+        try:
+            anyio.from_thread.run(ctx.report_progress, value, total, message)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("进度上报失败：%s", e)
+    return _cb
+
+
 @mcp.tool()
 def health_check() -> dict:
     """判断 MCP 服务是否健康。
@@ -200,7 +217,7 @@ def health_check() -> dict:
 
 
 @mcp.tool()
-def generate_subtitle(
+async def generate_subtitle(
     video_path: str,
     language: str = DEFAULT_LANGUAGE,
     model: str = DEFAULT_MODEL,
@@ -210,6 +227,7 @@ def generate_subtitle(
     beam_size: int = DEFAULT_BEAM_SIZE,
     output: str | None = None,
     local_files_only: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """为指定视频文件生成 SRT 字幕文件。
 
@@ -223,6 +241,9 @@ def generate_subtitle(
     - beam_size: beam search 大小（默认 5）
     - output: 输出 SRT 路径（默认 {视频名}.{检测语言}.srt）
     - local_files_only: 仅使用本地缓存模型，不联网下载（默认 False）
+
+    转写进度通过 MCP 的 notifications/progress 上报给客户端（若客户端在
+    请求中携带了 progressToken）。ctx 由 MCP 自动注入，调用方无需传递。
 
     返回包含输出路径、片段数、检测到的语言与时长的字典。
     """
@@ -238,40 +259,54 @@ def generate_subtitle(
 
     os.makedirs(models_dir, exist_ok=True)
 
-    whisper_model = get_whisper_model(
-        model, device, compute_type, models_dir, local_files_only,
-    )
+    # 模型加载、转写、写文件都是阻塞操作，丢到工作线程执行，避免阻塞事件
+    # 循环（async 工具直接在事件循环线程运行）。进度回调通过
+    # anyio.from_thread.run 把 ctx.report_progress 调度回事件循环，按 MCP
+    # 规范发送 notifications/progress。
+    def work():
+        whisper_model = get_whisper_model(
+            model, device, compute_type, models_dir, local_files_only,
+        )
+        segments_iter, info = whisper_model.transcribe(
+            video_path,
+            language=language,
+            beam_size=beam_size,
+            vad_filter=True,
+        )
+        # faster-whisper 的 segments 是惰性生成器，迭代才真正触发转写；
+        # 边收集边把进度通过 ctx.report_progress 上报给客户端。
+        segments = collect_segments(
+            segments_iter, info.duration,
+            log=lambda m: logger.info("generate_subtitle | %s", m),
+            progress=_make_progress_cb(ctx) if ctx else None,
+        )
+        logger.info("generate_subtitle | 转写完成，共 %d 段", len(segments))
 
-    segments_iter, info = whisper_model.transcribe(
-        video_path,
-        language=language,
-        beam_size=beam_size,
-        vad_filter=True,
-    )
-    # faster-whisper 的 segments 是惰性生成器，迭代才真正触发转写；
-    # 边收集边把进度记到 stderr 日志（stdout 用于 MCP 协议，不能写）。
-    segments = collect_segments(
-        segments_iter, info.duration,
-        log=lambda m: logger.info("generate_subtitle | %s", m),
-    )
-    logger.info("generate_subtitle | 转写完成，共 %d 段", len(segments))
+        # 修正异常超长的字幕持续时间（faster-whisper 偶发出现几十分钟的片段）
+        fixed = fix_segment_durations(segments)
+        if fixed:
+            logger.info("generate_subtitle | 修正 %d 条超长字幕", fixed)
 
-    # 修正异常超长的字幕持续时间（faster-whisper 偶发出现几十分钟的片段）
-    fixed = fix_segment_durations(segments)
-    if fixed:
-        logger.info("generate_subtitle | 修正 %d 条超长字幕", fixed)
+        # 确定输出路径
+        # 默认文件名格式：{文件名}.{语言类型}.srt，语言类型使用实际识别到的语言代码
+        detected_lang = info.language
+        if output:
+            base = os.path.splitext(output)[0]
+        else:
+            video_base = os.path.splitext(video_path)[0]
+            base = f"{video_base}.{detected_lang}"
+        srt_path = base + ".srt"
 
-    # 确定输出路径
-    # 默认文件名格式：{文件名}.{语言类型}.srt，语言类型使用实际识别到的语言代码
-    detected_lang = info.language
-    if output:
-        base = os.path.splitext(output)[0]
-    else:
-        video_base = os.path.splitext(video_path)[0]
-        base = f"{video_base}.{detected_lang}"
-    srt_path = base + ".srt"
+        generate_srt(
+            segments, srt_path,
+            log=lambda m: logger.info("generate_subtitle | %s", m),
+        )
+        return segments, info, srt_path
 
-    generate_srt(segments, srt_path)
+    segments, info, srt_path = await anyio.to_thread.run_sync(work)
+
+    if ctx:
+        await ctx.info(f"字幕生成完成：{len(segments)} 段 → {srt_path}")
 
     return {
         "output": srt_path,
@@ -283,7 +318,7 @@ def generate_subtitle(
 
 
 @mcp.tool()
-def translate_subtitle(
+async def translate_subtitle(
     srt_path: str,
     output: str | None = None,
     base_url: str = DEFAULT_BASE_URL,
@@ -294,6 +329,7 @@ def translate_subtitle(
     max_chars: int = DEFAULT_MAX_CHARS,
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    ctx: Context = None,
 ) -> dict:
     """将指定 SRT 字幕文件翻译成中文（或指定目标语言）。
 
@@ -311,6 +347,9 @@ def translate_subtitle(
     - max_chars: 每批最大字符数（默认 4000）
     - temperature: 采样温度（默认 0.1）
     - max_tokens: 每批响应最大 token 数（默认 4096）
+
+    翻译进度通过 MCP 的 notifications/progress 上报给客户端（若客户端在
+    请求中携带了 progressToken）。ctx 由 MCP 自动注入，调用方无需传递。
 
     返回包含输出路径与已翻译条目数的字典。
     """
@@ -348,24 +387,33 @@ def translate_subtitle(
             new_root = f"{root}.{target_code}"
         out_path = new_root + ext
 
-    with open(srt_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    entries = parse_srt(content)
-    if not entries:
-        raise ValueError(f"未能解析出任何字幕条目：{srt_path}")
+    # 文件读写与（阻塞的）HTTP 翻译调用丢到工作线程，避免阻塞事件循环；
+    # 进度回调通过 anyio.from_thread.run 桥接回事件循环发 notifications/progress。
+    def work():
+        with open(srt_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        entries = parse_srt(content)
+        if not entries:
+            raise ValueError(f"未能解析出任何字幕条目：{srt_path}")
 
-    client = OpenAI(base_url=base_url, api_key=api_key)
-    batches = make_batches(entries, batch_size, max_chars)
-    logger.info("translate_subtitle | 分为 %d 个批次", len(batches))
+        client = OpenAI(base_url=base_url, api_key=api_key)
+        batches = make_batches(entries, batch_size, max_chars)
+        logger.info("translate_subtitle | 分为 %d 个批次", len(batches))
 
-    # 逐批翻译，进度记到 stderr 日志（stdout 用于 MCP 协议，不能写）
-    translated = translate_batches(
-        client, model, batches, target_lang, temperature, max_tokens,
-        log=lambda m: logger.info("translate_subtitle | %s", m),
-    )
+        translated = translate_batches(
+            client, model, batches, target_lang, temperature, max_tokens,
+            log=lambda m: logger.info("translate_subtitle | %s", m),
+            progress=_make_progress_cb(ctx) if ctx else None,
+        )
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(entries_to_srt(translated))
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(entries_to_srt(translated))
+        return translated, batches
+
+    translated, batches = await anyio.to_thread.run_sync(work)
+
+    if ctx:
+        await ctx.info(f"翻译完成：{len(translated)} 条 → {out_path}")
 
     return {
         "output": out_path,
