@@ -8,8 +8,12 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from faster_whisper import WhisperModel
+
+
+MAX_SEGMENT_DURATION = 10.0  # 单条字幕最大持续时长（秒）
 
 
 def format_timestamp(seconds: float) -> str:
@@ -19,6 +23,61 @@ def format_timestamp(seconds: float) -> str:
     secs = int(seconds % 60)
     millis = int((seconds - int(seconds)) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def fix_segment_durations(segments: list, max_duration: float = MAX_SEGMENT_DURATION) -> int:
+    """修正异常超长的字幕持续时间。
+
+    faster-whisper 偶发出现某条字幕 end 远超实际（如持续几十分钟），
+    这里将超过 max_duration 的片段结束时间截断为 start + max_duration，
+    并保证与下一条片段不重叠。
+
+    直接原地改写 list 元素（faster-whisper 的 Segment 是不可变 NamedTuple，
+    所以替换为同等字段的可变对象）。返回被修正的片段数量。
+    """
+    fixed = 0
+    n = len(segments)
+    for i in range(n):
+        segment = segments[i]
+        start = segment.start
+        end = segment.end
+        # 防御 NaN/inf：非有限值直接跳过，避免误判
+        if not (start < end and end - start > max_duration):
+            continue
+
+        # 截断为本片段起点 + 最大时长
+        new_end = start + max_duration
+        # 若与下一条片段重叠，则压到下一条起点前留 1ms 间隔
+        if i + 1 < n:
+            next_start = segments[i + 1].start
+            if new_end > next_start:
+                new_end = max(start + 0.001, next_start - 0.001)
+
+        segments[i] = SimpleNamespace(start=start, end=new_end, text=segment.text)
+        fixed += 1
+    return fixed
+
+
+def collect_segments(
+    segments_iter,
+    total_duration: float,
+    progress_step: int = 50,
+    log=print,
+) -> list:
+    """流式收集 faster-whisper 的惰性片段生成器。
+
+    faster-whisper 的 transcribe() 返回惰性生成器，迭代才真正触发转写；
+    长视频耗时很久，这里边收集边按周期输出进度，避免看起来像卡死。
+
+    log 为进度输出回调，默认 print（CLI 场景）；MCP 等需要写入 stderr
+    的场景可传入 logger 相关回调。
+    """
+    segments: list = []
+    for seg in segments_iter:
+        segments.append(seg)
+        if progress_step and len(segments) % progress_step == 0:
+            log(f"  ... 已转写 {len(segments)} 段，当前 {seg.start:.0f}s / {total_duration:.0f}s")
+    return segments
 
 
 def generate_srt(segments: list, output_path: str) -> None:
@@ -129,7 +188,7 @@ def main():
 
     # 转写
     print("⏳ 正在转写...")
-    segments, info = model.transcribe(
+    segments_iter, info = model.transcribe(
         args.video,
         language=args.language,
         beam_size=args.beam_size,
@@ -140,13 +199,24 @@ def main():
     print(f"ℹ️  时长：{info.duration:.0f} 秒")
 
     # 收集所有片段
-    segments = list(segments)
+    # faster-whisper 的 segments 是惰性生成器，list() 才真正触发转写；
+    # 长视频在这里耗时很久，所以边迭代边打印进度，避免看起来像卡死。
+    segments = collect_segments(segments_iter, info.duration)
+    print(f"ℹ️  转写完成，共 {len(segments)} 段。")
+
+    # 修正异常超长的字幕持续时间（faster-whisper 偶发出现几十分钟的片段）
+    fixed = fix_segment_durations(segments)
+    if fixed:
+        print(f"ℹ️  共修正 {fixed} 条超长字幕的结束时间。")
 
     # 确定输出路径
+    # 默认文件名格式：{文件名}.{语言类型}.srt，语言类型使用实际识别到的语言代码
+    detected_lang = info.language
     if args.output:
         base = os.path.splitext(args.output)[0]
     else:
-        base = os.path.splitext(args.video)[0]
+        video_base = os.path.splitext(args.video)[0]
+        base = f"{video_base}.{detected_lang}"
 
     srt_path = base + ".srt"
     txt_path = base + ".txt"

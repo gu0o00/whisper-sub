@@ -36,6 +36,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("whisper-sub")
 
+# 屏蔽 openai/httpx 每次请求的 INFO 级输出（如 "HTTP Request: POST .../chat/completions ... 200 OK"），
+# 仅保留 WARNING 及以上，避免刷屏 stderr 日志。
+for _noisy in ("httpx", "openai", "openai._base_client"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 # 将 nvidia-cublas-cu12 的 DLL 目录加入 PATH，解决 cublas64_12.dll 找不到的问题
 _cublas_dir = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia" / "cublas" / "bin"
 if _cublas_dir.is_dir():
@@ -45,14 +50,19 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 # 复用现有脚本中的可复用函数
-from subtitle import format_timestamp, generate_srt
+from subtitle import (
+    collect_segments,
+    fix_segment_durations,
+    generate_srt,
+)
 from translate_srt import (
-    SrtEntry,
     entries_to_srt,
+    is_lang_code,
+    lang_to_code,
     make_batches,
     normalize_target_lang,
     parse_srt,
-    translate_batch,
+    translate_batches,
 )
 from openai import OpenAI
 
@@ -211,7 +221,7 @@ def generate_subtitle(
     - device: 推理设备 auto/cpu/cuda（默认 cuda）
     - compute_type: 计算精度（默认 float16）
     - beam_size: beam search 大小（默认 5）
-    - output: 输出 SRT 路径（默认与视频同名 .srt）
+    - output: 输出 SRT 路径（默认 {视频名}.{检测语言}.srt）
     - local_files_only: 仅使用本地缓存模型，不联网下载（默认 False）
 
     返回包含输出路径、片段数、检测到的语言与时长的字典。
@@ -232,19 +242,33 @@ def generate_subtitle(
         model, device, compute_type, models_dir, local_files_only,
     )
 
-    segments, info = whisper_model.transcribe(
+    segments_iter, info = whisper_model.transcribe(
         video_path,
         language=language,
         beam_size=beam_size,
         vad_filter=True,
     )
-    segments = list(segments)
+    # faster-whisper 的 segments 是惰性生成器，迭代才真正触发转写；
+    # 边收集边把进度记到 stderr 日志（stdout 用于 MCP 协议，不能写）。
+    segments = collect_segments(
+        segments_iter, info.duration,
+        log=lambda m: logger.info("generate_subtitle | %s", m),
+    )
+    logger.info("generate_subtitle | 转写完成，共 %d 段", len(segments))
+
+    # 修正异常超长的字幕持续时间（faster-whisper 偶发出现几十分钟的片段）
+    fixed = fix_segment_durations(segments)
+    if fixed:
+        logger.info("generate_subtitle | 修正 %d 条超长字幕", fixed)
 
     # 确定输出路径
+    # 默认文件名格式：{文件名}.{语言类型}.srt，语言类型使用实际识别到的语言代码
+    detected_lang = info.language
     if output:
         base = os.path.splitext(output)[0]
     else:
-        base = os.path.splitext(video_path)[0]
+        video_base = os.path.splitext(video_path)[0]
+        base = f"{video_base}.{detected_lang}"
     srt_path = base + ".srt"
 
     generate_srt(segments, srt_path)
@@ -278,7 +302,7 @@ def translate_subtitle(
 
     参数：
     - srt_path: 输入 SRT 文件路径（必填）
-    - output: 输出文件路径（默认在原文件名后加 .zh）
+    - output: 输出文件路径（默认 {文件名}.{目标语言代码}.srt，替换原语言段）
     - base_url: OpenAI 兼容接口地址
     - api_key: API Key（本地服务通常随意）
     - model: 翻译模型名称（需与本地服务加载的模型 ID 一致，默认 hy-mt2-1.8b）
@@ -306,11 +330,23 @@ def translate_subtitle(
     # 避免小模型把 "翻译成 zh" 误解而漂移到英语。
     target_lang = normalize_target_lang(target_lang)
 
+    # 输出路径
+    # 若未显式指定，按 {文件名}.{目标语言代码}.srt 生成：
+    #   BBI-174.ja.srt -> BBI-174.zh.srt（替换已存在的语言段）
+    #   BBI-174.srt    -> BBI-174.zh.srt（无语言段则追加）
     if output:
         out_path = output
     else:
         root, ext = os.path.splitext(srt_path)
-        out_path = f"{root}.zh{ext or '.srt'}"
+        ext = ext or ".srt"
+        target_code = lang_to_code(target_lang)
+        parts = root.split(".")
+        if len(parts) > 1 and is_lang_code(parts[-1]):
+            parts[-1] = target_code
+            new_root = ".".join(parts)
+        else:
+            new_root = f"{root}.{target_code}"
+        out_path = new_root + ext
 
     with open(srt_path, "r", encoding="utf-8") as f:
         content = f.read()
@@ -320,16 +356,13 @@ def translate_subtitle(
 
     client = OpenAI(base_url=base_url, api_key=api_key)
     batches = make_batches(entries, batch_size, max_chars)
+    logger.info("translate_subtitle | 分为 %d 个批次", len(batches))
 
-    translated: list[SrtEntry] = []
-    for batch in batches:
-        texts = translate_batch(
-            client, model, batch, target_lang, temperature, max_tokens,
-        )
-        for entry, text in zip(batch, texts):
-            translated.append(
-                SrtEntry(index=entry.index, timestamp=entry.timestamp, text=text)
-            )
+    # 逐批翻译，进度记到 stderr 日志（stdout 用于 MCP 协议，不能写）
+    translated = translate_batches(
+        client, model, batches, target_lang, temperature, max_tokens,
+        log=lambda m: logger.info("translate_subtitle | %s", m),
+    )
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(entries_to_srt(translated))

@@ -41,6 +41,14 @@ _LANG_NAME_MAP = {
     "ko": "韩语", "kor": "韩语", "korean": "韩语", "韩文": "韩语",
 }
 
+# 语言别名 → 短代码，用于生成输出文件名中的语言段（如 .zh）
+_LANG_CODE_MAP = {
+    "zh": "zh", "chinese": "zh", "中文": "zh", "chs": "zh", "简体中文": "zh", "简体": "zh",
+    "en": "en", "english": "en", "英文": "en", "英语": "en",
+    "ja": "ja", "jp": "ja", "japanese": "ja", "日语": "ja", "日文": "ja",
+    "ko": "ko", "kor": "ko", "korean": "ko", "韩语": "ko", "韩文": "ko",
+}
+
 
 def normalize_target_lang(lang: str) -> str:
     """把语言代码/别名归一化为语言全称。未知值原样返回。"""
@@ -48,6 +56,19 @@ def normalize_target_lang(lang: str) -> str:
         return lang
     key = lang.strip().lower()
     return _LANG_NAME_MAP.get(key, lang.strip())
+
+
+def lang_to_code(lang: str) -> str:
+    """把语言代码/别名归一化为短代码（用于文件名）。未知值原样小写返回。"""
+    if not lang:
+        return lang
+    key = lang.strip().lower()
+    return _LANG_CODE_MAP.get(key, lang.strip().lower())
+
+
+def is_lang_code(s: str) -> bool:
+    """判断字符串是否是已知的语言代码/别名（用于识别文件名里的语言段）。"""
+    return bool(s) and s.strip().lower() in _LANG_CODE_MAP
 
 
 def parse_srt(content: str) -> list[SrtEntry]:
@@ -90,19 +111,9 @@ def build_prompt(batch: list[SrtEntry], target_lang: str) -> str:
     """构造 Hy-MT2 风格的结构化数据翻译 prompt。"""
     source_data = entries_to_srt(batch)
     return (
-        f"### Task\n"
+        f"# 任务目标\n"
         f"将下面 SRT 字幕数据中的「字幕文本」翻译成 {target_lang}。"
         f"SRT 是结构化数据，必须严格保留其结构与所有非文本字段。\n\n"
-        f"### Strict Rules\n"
-        f"- 必须完整保留 SRT 结构：序号行、时间轴行、空行分隔，与原文完全一致。\n"
-        f"- 序号与时间轴（如 00:01:23,456 --> 00:01:25,789）一律不得修改、不得翻译、不得重新编号。\n"
-        f"- 仅翻译字幕文本内容，不翻译序号与时间轴。\n"
-        f"- 即使原文非常短（如单个语气词），也必须翻译成 {target_lang}，"
-        f"严禁原样保留原文或回显源文。\n"
-        f"- 不得添加任何解释、注释、前后缀或额外说明，只输出翻译后的 SRT 数据。\n"
-        f"- 输入共 {len(batch)} 条字幕，输出必须同样是 {len(batch)} 条，顺序一一对应。\n"
-        f"- 保留原文字幕文本中的换行：原文文本有几行，译文文本就对应几行。\n"
-        f"- 不要合并或拆分任何条目。\n\n"
         f"### Source Data\n"
         f"{source_data}"
     )
@@ -224,9 +235,8 @@ def translate_single(
 ) -> str:
     """单条文本翻译回退路径。"""
     prompt = (
-        f"Translate the following text into {target_lang}. "
-        f"Note that you should only output the translated result "
-        f"without any additional explanation:\n\n{text}"
+        f"请将一下文本翻译为： {target_lang}. "
+        f"注意只需要输出翻译后的结果，不要额外解释\n\n\n\n{text}"
     )
     try:
         raw = call_model(client, model, prompt, temperature, max_tokens=512)
@@ -253,6 +263,35 @@ def make_batches(
     if cur:
         batches.append(cur)
     return batches
+
+
+def translate_batches(
+    client: OpenAI,
+    model: str,
+    batches: list[list[SrtEntry]],
+    target_lang: str,
+    temperature: float,
+    max_tokens: int,
+    log=print,
+) -> list[SrtEntry]:
+    """逐批翻译并组装结果，按批次输出进度。
+
+    log 为进度输出回调，默认 print（CLI 场景）；MCP 等需要写入 stderr
+    的场景可传入 logger 相关回调。返回与输入条目顺序一致的已翻译条目列表。
+    """
+    translated: list[SrtEntry] = []
+    total = len(batches)
+    for bi, batch in enumerate(batches, start=1):
+        if log:
+            log(f"⏳ 翻译批次 {bi}/{total}（{len(batch)} 条）...")
+        texts = translate_batch(
+            client, model, batch, target_lang, temperature, max_tokens,
+        )
+        for entry, text in zip(batch, texts):
+            translated.append(
+                SrtEntry(index=entry.index, timestamp=entry.timestamp, text=text)
+            )
+    return translated
 
 
 def main():
@@ -283,11 +322,22 @@ def main():
         sys.exit(1)
 
     # 输出路径
+    # 若未显式指定，按 {文件名}.{目标语言代码}.srt 生成：
+    #   BBI-174.ja.srt -> BBI-174.zh.srt（替换已存在的语言段）
+    #   BBI-174.srt    -> BBI-174.zh.srt（无语言段则追加）
     if args.output:
         output = args.output
     else:
         root, ext = os.path.splitext(args.input)
-        output = f"{root}.zh{ext or '.srt'}"
+        ext = ext or ".srt"
+        target_code = lang_to_code(args.target_lang)
+        parts = root.split(".")
+        if len(parts) > 1 and is_lang_code(parts[-1]):
+            parts[-1] = target_code
+            new_root = ".".join(parts)
+        else:
+            new_root = f"{root}.{target_code}"
+        output = new_root + ext
 
     # 读取并解析
     with open(args.input, "r", encoding="utf-8") as f:
@@ -313,17 +363,10 @@ def main():
     batches = make_batches(entries, args.batch_size, args.max_chars)
     print(f"📦 分为 {len(batches)} 个批次（每批 ≤ {args.batch_size} 条 / {args.max_chars} 字符）")
 
-    translated: list[SrtEntry] = []
-    for bi, batch in enumerate(batches, start=1):
-        print(f"⏳ 翻译批次 {bi}/{len(batches)}（{len(batch)} 条）...")
-        texts = translate_batch(
-            client, args.model, batch, target_lang,
-            args.temperature, args.max_tokens,
-        )
-        for entry, text in zip(batch, texts):
-            translated.append(
-                SrtEntry(index=entry.index, timestamp=entry.timestamp, text=text)
-            )
+    translated = translate_batches(
+        client, args.model, batches, target_lang,
+        args.temperature, args.max_tokens,
+    )
 
     # 写出
     with open(output, "w", encoding="utf-8") as f:
