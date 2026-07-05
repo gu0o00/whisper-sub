@@ -56,21 +56,24 @@ from subtitle import (
     fix_segment_durations,
     generate_srt,
 )
-from translate_srt import (
+from srt_utils import (
     entries_to_srt,
     is_lang_code,
     lang_to_code,
-    make_batches,
     normalize_target_lang,
     parse_srt,
+)
+from translate_srt_ai import (
+    make_batches,
     translate_batches,
 )
+from translate_srt_bing import translate_srt_via_bing
 from openai import OpenAI
 
 # 默认配置（与现有脚本保持一致）
 DEFAULT_MODEL = "large-v3-turbo"
-# 默认配置
-DEFAULT_MODEL = "large-v3"
+# 根据potplayer的说明，large-v2的效果要比large-v3好
+DEFAULT_MODEL = "large-v2"
 DEFAULT_MODELS_DIR = str(Path(__file__).parent / "models")
 DEFAULT_DEVICE = "cuda"
 DEFAULT_COMPUTE_TYPE = "float16"
@@ -419,6 +422,56 @@ async def translate_subtitle(
         "output": out_path,
         "translated": len(translated),
         "batches": len(batches),
+    }
+
+
+@mcp.tool()
+async def translate_subtitle_bing(
+    srt_path: str,
+    output: str | None = None,
+    source_lang: str = "ja",
+    target_lang: str = "zh-Hans",
+    ctx: Context = None,
+) -> dict:
+    """使用 Microsoft Translator (Bing) API 将 SRT 字幕文件翻译成中文或指定目标语言。
+
+    参数：
+    - srt_path: 输入 SRT 文件路径（必填）
+    - output: 输出文件路径（默认自动生成，如 ofes-043.zh.srt）
+    - source_lang: 源语言代码，Bing API 格式（默认 ja）
+    - target_lang: 目标语言代码，Bing API 格式（默认 zh-Hans）
+
+    翻译进度通过 MCP 的 notifications/progress 上报给客户端（若客户端在
+    请求中携带了 progressToken）。ctx 由 MCP 自动注入，调用方无需传递。
+
+    返回包含输出路径与已翻译条目数的字典。
+    """
+    logger.info(
+        "调用 translate_subtitle_bing | 参数: "
+        "srt_path=%r, output=%r, source_lang=%r, target_lang=%r",
+        srt_path, output, source_lang, target_lang,
+    )
+    if not os.path.isfile(srt_path):
+        raise FileNotFoundError(f"字幕文件不存在：{srt_path}")
+
+    def work():
+        out_path, count = translate_srt_via_bing(
+            srt_path=srt_path,
+            output=output,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            progress=_make_progress_cb(ctx) if ctx else None,
+        )
+        return out_path, count
+
+    out_path, count = await anyio.to_thread.run_sync(work)
+
+    if ctx:
+        await ctx.info(f"Bing 翻译完成：{count} 条 → {out_path}")
+
+    return {
+        "output": out_path,
+        "translated": count,
     }
 
 
