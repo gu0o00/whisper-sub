@@ -6,6 +6,8 @@
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +16,39 @@ from faster_whisper import WhisperModel
 
 
 MAX_SEGMENT_DURATION = 5.0  # 单条字幕最大持续时长（秒）
+
+# 人声增强滤波链（面向 ASR/Whisper 转写，重点避免漏掉安静/被压低的对话）：
+#   highpass=f=80       去低频隆隆声，保留男声基频
+#   lowpass=f=7500      只切 7.5kHz 以上，保留齿擦音/清辅音频谱
+#   afftdn=nr=6         降噪：压呼吸/气声等宽带噪声（频谱减法，对语音间隙的喘息
+#                       有效，对语音内的气声有限）；默认 nr=12 偏激进会抹轻声，
+#                       控制在 6 平衡"压呼吸"与"保轻声"——这是两者权衡的主旋钮
+#   compand=...         轻度压扩（保守）：仅对极轻声(-55dB)温和抬 ~8dB、响声限幅，
+#                       不大幅压缩动态范围——过强压缩会破坏 Whisper 依赖的语音自然
+#                       动态特征反而降低识别率。轻声抬升主要交给 dynaudnorm
+#                       "compand=attacks=0:decays=0.5:points=-80/-80|-55/-47|-30/-27|0/-4:gain=0, "
+#   dynaudnorm=...      响度归一：自适应抬安静段；g=15 适度增益（更大易过响失真）
+FFMPEG_AUDIO_FILTER = (
+    "highpass=f=80, lowpass=f=7500, afftdn=nr=6, "
+    "dynaudnorm=f=150:g=15:p=0.9"
+)
+
+# Whisper 转写参数（为保留轻声/被压低对话调优，CLI 与 MCP 共用以避免参数漂移）：
+#   vad_parameters.threshold=0.15   默认 0.5 偏激进，轻声易被判非语音切掉，降到 0.15
+#   no_speech_threshold=0.3         默认 0.6：段被判"非语音"概率超此值就跳过，轻声男声
+#                                   极易被误判，降到 0.3 保留（漏台词的关键修复之一）
+#   log_prob_threshold=-1.5         默认 -1.0：平均对数概率低于此值丢弃，轻声置信度天然
+#                                   偏低，降到 -1.5 避免被当噪声扔掉（漏台词的关键修复之二）
+#   compression_ratio_threshold=4.0 默认 2.4：压缩比超此值丢弃（防幻觉），轻声短句易
+#                                   触发，放宽到 4.0
+#   min_silence_duration_ms=1000     默认 2000：缩短以避免吞掉短停顿后的语音
+WHISPER_TRANSCRIBE_KWARGS = dict(
+    vad_filter=True,
+    vad_parameters=dict(threshold=0.15, min_silence_duration_ms=1000),
+    no_speech_threshold=0.3,
+    log_prob_threshold=-1.5,
+    compression_ratio_threshold=4.0,
+)
 
 
 def format_timestamp(seconds: float) -> str:
@@ -123,6 +158,50 @@ def generate_txt(segments: list, output_path: str, log=print) -> None:
         log(f"✅ 文本已生成：{output_path}")
 
 
+def enhance_audio(video_path: str, wav_path: str, log=print) -> str:
+    """用 ffmpeg 对视频音频做人声增强并导出 16kHz 单声道 wav。
+
+    滤波链见 FFMPEG_AUDIO_FILTER：高通/低通框定人声频段、afftdn 降噪、
+    compand 压扩动态范围。输出 wav 供 faster-whisper 转写使用，调用方需在
+    转写结束后自行删除该临时文件。
+
+    返回生成的 wav 文件路径。ffmpeg 缺失或执行失败时抛出异常，并清理残缺输出。
+    """
+    if shutil.which("ffmpeg") is None:
+        raise FileNotFoundError(
+            "未找到 ffmpeg，请先安装并将其加入 PATH（https://ffmpeg.org/）"
+        )
+
+    # -y 覆盖已存在的输出，避免 ffmpeg 在非交互环境下卡在覆盖确认提示
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-vn",  # 丢弃视频流，仅处理音频
+        "-af", FFMPEG_AUDIO_FILTER,
+        "-ar", "16000",
+        "-ac", "1",
+        "-threads", "0",
+        wav_path,
+    ]
+    if log:
+        log(f"🔊 正在增强音频并导出：{wav_path}")
+
+    # ffmpeg 进度信息走 stderr，捕获后仅在失败时输出，避免刷屏
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        if os.path.isfile(wav_path):
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+        raise RuntimeError(
+            f"ffmpeg 音频增强失败（返回码 {result.returncode}）：\n{result.stderr}"
+        )
+    if log:
+        log(f"✅ 音频增强完成：{wav_path}")
+    return wav_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="使用 faster-whisper 为视频生成字幕"
@@ -133,7 +212,7 @@ def main():
     parser.add_argument(
         "-m", "--model", type=str, default="large-v3-turbo",
         help=(
-            "模型大小或路径（默认：large-v3-turbo）。"
+            "模型大小或路径（默认：large-v3-turbo，兼顾速度与识别效果）。"
             "可选：tiny, base, small, medium, large-v1, large-v2, large-v3, "
             "large-v3-turbo, turbo；也可直接指定本地已转换的模型目录路径。"
         )
@@ -174,6 +253,15 @@ def main():
         "--txt", action="store_true",
         help="同时生成带时间戳的纯文本文件"
     )
+    parser.add_argument(
+        "--enhance-audio", action="store_true", default=True,
+        help="先用 ffmpeg 对视频音频做人声增强（高通 80Hz/低通 7.5kHz/降噪/compand 压扩/"
+             "响度归一），导出 16kHz 单声道 wav 再转写，转写完成后自动删除该 wav。默认启用。",
+    )
+    parser.add_argument(
+        "--no-enhance-audio", dest="enhance_audio", action="store_false",
+        help="关闭音频增强，直接用原始视频音轨转写。",
+    )
 
     args = parser.parse_args()
 
@@ -194,6 +282,10 @@ def main():
     print(f"🎬 视频：{args.video}")
     print(f"🌐 语言：{args.language}")
     print(f"⚙️  设备：{device}，精度：{compute_type}")
+    if args.enhance_audio:
+        print(f"🔊 音频增强：已启用（将导出 16kHz 单声道 wav 再转写）")
+    else:
+        print(f"🔊 音频增强：已关闭（直接使用原始视频音轨）")
 
     # 加载模型（model 为大小名时自动从 HF Hub 下载到 models_dir）
     print("⏳ 正在加载模型...")
@@ -205,22 +297,45 @@ def main():
         local_files_only=args.local_files_only,
     )
 
+    # 音频输入：默认直接用视频文件；启用「音频增强」时先用 ffmpeg 导出增强后的 wav
+    audio_input = args.video
+    enhanced_wav = None
+    if args.enhance_audio:
+        # 临时 wav 保存在当前目录，与视频同名但扩展名为 .wav
+        video_stem = Path(args.video).stem
+        enhanced_wav = os.path.join(os.getcwd(), f"{video_stem}.wav")
+        enhance_audio(args.video, enhanced_wav)
+        audio_input = enhanced_wav
+
     # 转写
-    print("⏳ 正在转写...")
-    segments_iter, info = model.transcribe(
-        args.video,
-        language=args.language,
-        beam_size=args.beam_size,
-        vad_filter=True,  # 过滤静音部分
-    )
+    # 注意：faster-whisper 的 segments 是惰性生成器，真正读取音频发生在迭代期间，
+    # 所以增强 wav 必须保留到 collect_segments 结束才能删除。
+    try:
+        print("⏳ 正在转写...")
+        segments_iter, info = model.transcribe(
+            audio_input,
+            language=args.language,
+            beam_size=args.beam_size,
+            # 转写参数（VAD + 三个丢弃阈值）为保留轻声调优，见 WHISPER_TRANSCRIBE_KWARGS
+            **WHISPER_TRANSCRIBE_KWARGS,
+        )
 
-    print(f"ℹ️  检测语言：{info.language}（概率 {info.language_probability:.2%}）")
-    print(f"ℹ️  时长：{info.duration:.0f} 秒")
+        print(f"ℹ️  检测语言：{info.language}（概率 {info.language_probability:.2%}）")
+        print(f"ℹ️  时长：{info.duration:.0f} 秒")
 
-    # 收集所有片段
-    # faster-whisper 的 segments 是惰性生成器，list() 才真正触发转写；
-    # 长视频在这里耗时很久，所以边迭代边打印进度，避免看起来像卡死。
-    segments = collect_segments(segments_iter, info.duration)
+        # 收集所有片段
+        # faster-whisper 的 segments 是惰性生成器，list() 才真正触发转写；
+        # 长视频在这里耗时很久，所以边迭代边打印进度，避免看起来像卡死。
+        segments = collect_segments(segments_iter, info.duration)
+    finally:
+        # 转写完成（含异常退出）后清理临时增强 wav
+        if enhanced_wav and os.path.isfile(enhanced_wav):
+            try:
+                os.remove(enhanced_wav)
+                print(f"🧹 已清理临时音频：{enhanced_wav}")
+            except OSError as e:
+                print(f"⚠️ 清理临时音频失败：{enhanced_wav}（{e}）")
+
     print(f"ℹ️  转写完成，共 {len(segments)} 段。")
 
     # 修正异常超长的字幕持续时间（faster-whisper 偶发出现几十分钟的片段）

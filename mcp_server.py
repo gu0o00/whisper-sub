@@ -52,7 +52,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 # 复用现有脚本中的可复用函数
 from subtitle import (
+    WHISPER_TRANSCRIBE_KWARGS,
     collect_segments,
+    enhance_audio as run_enhance_audio,
     fix_segment_durations,
     generate_srt,
 )
@@ -71,9 +73,10 @@ from translate_srt_bing import translate_srt_via_bing
 from openai import OpenAI
 
 # 默认配置（与现有脚本保持一致）
+# 默认用 large-v3-turbo：优先保证生成速度。轻声漏识别由 Whisper 丢弃阈值
+# （no_speech/log_prob/compression_ratio）+ 音频增强（compand 等）兜底；
+# 如需更高识别率可按需切换 large-v2（本地已缓存）。
 DEFAULT_MODEL = "large-v3-turbo"
-# 根据potplayer的说明，large-v2的效果要比large-v3好
-DEFAULT_MODEL = "large-v2"
 DEFAULT_MODELS_DIR = str(Path(__file__).parent / "models")
 DEFAULT_DEVICE = "cuda"
 DEFAULT_COMPUTE_TYPE = "float16"
@@ -230,6 +233,7 @@ async def generate_subtitle(
     beam_size: int = DEFAULT_BEAM_SIZE,
     output: str | None = None,
     local_files_only: bool = False,
+    enhance_audio: bool = True,
     ctx: Context = None,
 ) -> dict:
     """为指定视频文件生成 SRT 字幕文件。
@@ -244,6 +248,8 @@ async def generate_subtitle(
     - beam_size: beam search 大小（默认 5）
     - output: 输出 SRT 路径（默认 {视频名}.{检测语言}.srt）
     - local_files_only: 仅使用本地缓存模型，不联网下载（默认 False）
+    - enhance_audio: 转写前先用 ffmpeg 做人声增强（高通/低通/降噪/compand/响度归一），
+      导出 16kHz 单声道 wav 再转写，显著提升轻声/被压低对话的检出率（默认 True）
 
     转写进度通过 MCP 的 notifications/progress 上报给客户端（若客户端在
     请求中携带了 progressToken）。ctx 由 MCP 自动注入，调用方无需传递。
@@ -270,41 +276,69 @@ async def generate_subtitle(
         whisper_model = get_whisper_model(
             model, device, compute_type, models_dir, local_files_only,
         )
-        segments_iter, info = whisper_model.transcribe(
-            video_path,
-            language=language,
-            beam_size=beam_size,
-            vad_filter=True,
-        )
-        # faster-whisper 的 segments 是惰性生成器，迭代才真正触发转写；
-        # 边收集边把进度通过 ctx.report_progress 上报给客户端。
-        segments = collect_segments(
-            segments_iter, info.duration,
-            log=lambda m: logger.info("generate_subtitle | %s", m),
-            progress=_make_progress_cb(ctx) if ctx else None,
-        )
-        logger.info("generate_subtitle | 转写完成，共 %d 段", len(segments))
 
-        # 修正异常超长的字幕持续时间（faster-whisper 偶发出现几十分钟的片段）
-        fixed = fix_segment_durations(segments)
-        if fixed:
-            logger.info("generate_subtitle | 修正 %d 条超长字幕", fixed)
+        # 音频输入：默认先用 ffmpeg 做人声增强导出 16kHz 单声道 wav 再转写
+        # （与 CLI 一致；增强可显著提升轻声/被压低对话的检出率）。临时 wav 放
+        # 视频同目录（MCP 的 cwd 不可控），转写结束后在 finally 清理。
+        audio_input = video_path
+        enhanced_wav = None
+        if enhance_audio:
+            video_dir = os.path.dirname(video_path) or "."
+            enhanced_wav = os.path.join(video_dir, f"{Path(video_path).stem}.wav")
+            run_enhance_audio(
+                video_path, enhanced_wav,
+                log=lambda m: logger.info("generate_subtitle | %s", m),
+            )
+            audio_input = enhanced_wav
 
-        # 确定输出路径
-        # 默认文件名格式：{文件名}.{语言类型}.srt，语言类型使用实际识别到的语言代码
-        detected_lang = info.language
-        if output:
-            base = os.path.splitext(output)[0]
-        else:
-            video_base = os.path.splitext(video_path)[0]
-            base = f"{video_base}.{detected_lang}"
-        srt_path = base + ".srt"
+        try:
+            segments_iter, info = whisper_model.transcribe(
+                audio_input,
+                language=language,
+                beam_size=beam_size,
+                # 转写参数（VAD + 三个丢弃阈值）为保留轻声调优，见 WHISPER_TRANSCRIBE_KWARGS
+                **WHISPER_TRANSCRIBE_KWARGS,
+            )
+            # faster-whisper 的 segments 是惰性生成器，迭代才真正触发转写；
+            # 边收集边把进度通过 ctx.report_progress 上报给客户端。
+            segments = collect_segments(
+                segments_iter, info.duration,
+                log=lambda m: logger.info("generate_subtitle | %s", m),
+                progress=_make_progress_cb(ctx) if ctx else None,
+            )
+            logger.info("generate_subtitle | 转写完成，共 %d 段", len(segments))
 
-        generate_srt(
-            segments, srt_path,
-            log=lambda m: logger.info("generate_subtitle | %s", m),
-        )
-        return segments, info, srt_path
+            # 修正异常超长的字幕持续时间（faster-whisper 偶发出现几十分钟的片段）
+            fixed = fix_segment_durations(segments)
+            if fixed:
+                logger.info("generate_subtitle | 修正 %d 条超长字幕", fixed)
+
+            # 确定输出路径
+            # 默认文件名格式：{文件名}.{语言类型}.srt，语言类型使用实际识别到的语言代码
+            detected_lang = info.language
+            if output:
+                base = os.path.splitext(output)[0]
+            else:
+                video_base = os.path.splitext(video_path)[0]
+                base = f"{video_base}.{detected_lang}"
+            srt_path = base + ".srt"
+
+            generate_srt(
+                segments, srt_path,
+                log=lambda m: logger.info("generate_subtitle | %s", m),
+            )
+            return segments, info, srt_path
+        finally:
+            # 转写完成（含异常退出）后清理临时增强 wav
+            if enhanced_wav and os.path.isfile(enhanced_wav):
+                try:
+                    os.remove(enhanced_wav)
+                    logger.info("generate_subtitle | 已清理临时音频：%s", enhanced_wav)
+                except OSError as e:
+                    logger.warning(
+                        "generate_subtitle | 清理临时音频失败：%s（%s）",
+                        enhanced_wav, e,
+                    )
 
     segments, info, srt_path = await anyio.to_thread.run_sync(work)
 

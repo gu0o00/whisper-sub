@@ -43,6 +43,7 @@ python subtitle.py <视频路径> [选项]
 | `--beam_size` | `5` | Beam search 大小 |
 | `--local-files-only` | 关闭 | 仅使用本地缓存模型，不联网下载 |
 | `--txt` | 关闭 | 同时生成带时间戳的纯文本文件 |
+| `--enhance-audio` / `--no-enhance-audio` | 启用 | 先用 ffmpeg 对音频做人声增强（高通/低通/降噪/压扩）导出 16kHz 单声道 wav 再转写，完成后自动删除该 wav。默认启用，`--no-enhance-audio` 关闭 |
 
 示例：
 
