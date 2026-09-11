@@ -9,6 +9,7 @@ dependencies = [
     "mcp>=1.28.1",
     "nvidia-cublas-cu12>=12.9.2.10",
     "openai>=1.0.0",
+    "requests>=2.34.2",
     "torch>=2.12.1",
     "transformers>=5.12.1",
 ]
